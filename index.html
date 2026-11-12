@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registration Helper</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* Plain single-column tool: current code on top, progress list below. */
+  :root { --fg:#16181d; --muted:#626873; --bg:#ffffff; --line:#d9dce1; --ok:#1a7f37; --bad:#b42318; --accent:#0b5cad; --panel:#f5f6f8; --on-solid:#ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --fg:#e8eaee; --muted:#9aa0aa; --bg:#14161a; --line:#2f333a; --ok:#4cc26a; --bad:#f07167; --accent:#6aa9f0; --panel:#1d2025; color-scheme: dark; }
+  }
+  :root[data-theme="dark"] { --fg:#e8eaee; --muted:#9aa0aa; --bg:#14161a; --line:#2f333a; --ok:#4cc26a; --bad:#f07167; --accent:#6aa9f0; --panel:#1d2025; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding-block: 24px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  h1 { font-size: 18px; margin: 0 0 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .code { font: 600 40px/1.1 ui-monospace, Consolas, monospace; letter-spacing: 1px; margin: 6px 0; word-break: break-all; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  button { font: inherit; padding: 10px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: .4; cursor: default; }
+  /* Fixed dark fills in both themes so white text stays readable. */
+  button.got { background: #1a7f37; border-color: #1a7f37; color: var(--on-solid); }
+  button.missed { background: #b42318; border-color: #b42318; color: var(--on-solid); }
+  button.big { flex: 1 1 140px; padding: 14px; font-weight: 600; }
+  button.arm { border-color: var(--bad); color: var(--bad); }
+  .save { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+  .save.warn { color: var(--bad); font-weight: 600; }
+  .note { margin-top: 10px; font-size: 14px; color: var(--muted); }
+  .errors { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 12px 16px; }
+  .errors li { margin: 4px 0; }
+  h2 { font-size: 15px; margin: 28px 0 8px; }
+  .course { border-top: 1px solid var(--line); padding: 10px 0; }
+  .course .name { font-weight: 600; }
+  .course .tag { font-size: 13px; margin-left: 6px; color: var(--muted); }
+  ul.secs { list-style: none; padding: 0; margin: 6px 0 0; font-size: 14px; }
+  ul.secs li { padding: 2px 0; display: flex; gap: 8px; min-width: 0; }
+  ul.secs li > span:last-child { min-width: 0; }
+  ul.secs .st { width: 76px; flex: none; }
+  .st-got { color: var(--ok); font-weight: 600; }
+  .st-missed { color: var(--bad); text-decoration: line-through; }
+  .st-next { color: var(--accent); font-weight: 600; }
+  .st-clash, .st-untried { color: var(--muted); }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; }
+</style>
+
+<main>
+  <h1>Registration Helper</h1>
+  <div id="app"></div>
+</main>
+
+<script>
+// Decision logic for the registration helper. No UI code here.
+// Works in the browser (window.Engine) and in Node (require) so it can be tested.
+(function (root) {
+  'use strict';
+
+  var DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  var TIME_RE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/;
+
+  // "Mon 09:00-10:15" -> { day: 'Mon', start: 540, end: 615 } (minutes since midnight)
+  function parseSlot(text) {
+    var m = TIME_RE.exec(String(text).trim());
+    if (!m) throw new Error('bad time "' + text + '" (expected like "Mon 09:00-10:15", 24-hour clock)');
+    var h1 = +m[2], m1 = +m[3], h2 = +m[4], m2 = +m[5];
+    if (h1 > 23 || h2 > 23 || m1 > 59 || m2 > 59) throw new Error('bad time "' + text + '"');
+    var start = h1 * 60 + m1, end = h2 * 60 + m2;
+    if (start >= end) throw new Error('time "' + text + '" ends before it starts');
+    return { day: m[1], start: start, end: end };
+  }
+
+  // Two slots clash when they are on the same day and overlap.
+  // Back-to-back (one ends 10:15, next starts 10:15) is NOT a clash.
+  function slotsOverlap(a, b) {
+    return a.day === b.day && a.start < b.end && b.start < a.end;
+  }
+
+  function sectionsClash(a, b) {
+    for (var i = 0; i < a.slots.length; i++)
+      for (var j = 0; j < b.slots.length; j++)
+        if (slotsOverlap(a.slots[i], b.slots[j])) return true;
+    return false;
+  }
+
+  function asArray(x) { return Array.isArray(x) ? x : [x]; }
+
+  // Validates the hand-written data and builds lookup tables.
+  // Returns { errors: [...] } or { model }.
+  function build(courses, rules) {
+    var errors = [];
+    var byCode = {};       // code -> { code, label, times, slots, courseIndex }
+    var courseIndexByName = {};
+    rules = rules || [];
+
+    if (!Array.isArray(courses) || courses.length === 0) {
+      return { errors: ['COURSES must be a non-empty list.'] };
+    }
+
+    var model = { courses: [], byCode: byCode, rules: [] };
+
+    courses.forEach(function (c, ci) {
+      var where = 'Course #' + (ci + 1) + (c && c.name ? ' (' + c.name + ')' : '');
+      if (!c || !c.name) { errors.push(where + ': missing name.'); return; }
+      if (courseIndexByName[c.name] !== undefined) errors.push(where + ': duplicate course name.');
+      courseIndexByName[c.name] = ci;
+      if (!Array.isArray(c.sections) || c.sections.length === 0) {
+        errors.push(where + ': needs at least one section.');
+      }
+      var secs = [];
+      (c.sections || []).forEach(function (s, si) {
+        var code = s && s.code !== undefined ? String(s.code).trim() : '';
+        var sw = where + ', section #' + (si + 1);
+        if (!code) { errors.push(sw + ': missing code.'); return; }
+        if (byCode[code]) { errors.push(sw + ': code ' + code + ' is used more than once.'); return; }
+        var slots = [];
+        (s.times || []).forEach(function (t) {
+          try { slots.push(parseSlot(t)); } catch (e) { errors.push(sw + ' (' + code + '): ' + e.message); }
+        });
+        var sec = { code: code, label: s.label || '', times: s.times || [], slots: slots, courseIndex: ci };
+        byCode[code] = sec;
+        secs.push(sec);
+      });
+      model.courses.push({ name: c.name, sections: secs });
+    });
+
+    rules.forEach(function (r, ri) {
+      var where = 'Rule #' + (ri + 1);
+      if (!r) { errors.push(where + ': empty.'); return; }
+      var target = courseIndexByName[r.course];
+      if (target === undefined) { errors.push(where + ': unknown course "' + r.course + '".'); return; }
+      var ifGot = asArray(r.ifGot).map(function (x) { return String(x).trim(); });
+      if (ifGot.length === 0 || (ifGot.length === 1 && !ifGot[0])) errors.push(where + ': "ifGot" is empty.');
+      ifGot.forEach(function (code) {
+        var s = byCode[code];
+        if (!s) errors.push(where + ': "ifGot" code ' + code + ' does not exist.');
+        else if (s.courseIndex >= target) {
+          errors.push(where + ': "ifGot" code ' + code + ' belongs to ' + courses[s.courseIndex].name +
+            ', which does not come before ' + r.course + ' in the list, so the rule could never apply.');
+        }
+      });
+      var order = asArray(r.order || []).map(function (x) { return String(x).trim(); });
+      if (order.length === 0) errors.push(where + ': "order" is empty.');
+      var seen = {};
+      order.forEach(function (code) {
+        if (seen[code]) errors.push(where + ': code ' + code + ' appears twice in "order".');
+        seen[code] = true;
+        var s = byCode[code];
+        if (!s) errors.push(where + ': "order" code ' + code + ' does not exist.');
+        else if (s.courseIndex !== target) errors.push(where + ': "order" code ' + code + ' is not a section of ' + r.course + '.');
+      });
+      model.rules.push({ index: ri, courseIndex: target, ifGot: ifGot, order: order, note: r.note || '' });
+    });
+
+    if (errors.length) return { errors: errors };
+    return { model: model };
+  }
+
+  // Ranking of sections for one course, given the codes already obtained.
+  // The FIRST rule (in file order) whose ifGot codes are all obtained wins.
+  // Sections in rule.order come first, in that order; any sections the rule
+  // did not mention follow in their default order (nothing is silently dropped).
+  function orderFor(model, ci, obtainedSet) {
+    var course = model.courses[ci];
+    for (var i = 0; i < model.rules.length; i++) {
+      var r = model.rules[i];
+      if (r.courseIndex !== ci) continue;
+      if (!r.ifGot.every(function (c) { return obtainedSet[c]; })) continue;
+      var listed = r.order.map(function (c) { return model.byCode[c]; });
+      var inRule = {};
+      r.order.forEach(function (c) { inRule[c] = true; });
+      var rest = course.sections.filter(function (s) { return !inRule[s.code]; });
+      return { sections: listed.concat(rest), rule: r };
+    }
+    return { sections: course.sections.slice(), rule: null };
+  }
+
+  // Replays the log of what happened and works out what to try next.
+  // log entries: { code, result: 'got' | 'missed' } or { course: index, result: 'skipped' }
+  function compute(model, log) {
+    var gotByCourse = {}, missed = {}, skipped = {};
+    (log || []).forEach(function (e) {
+      if (e.result === 'skipped') { skipped[e.course] = true; return; }
+      var s = model.byCode[e.code];
+      if (!s) return; // code no longer in the data; ignore
+      if (e.result === 'got') gotByCourse[s.courseIndex] = s;
+      else if (e.result === 'missed') missed[s.code] = true;
+    });
+
+    var obtained = [];      // sections obtained in earlier courses, in order
+    var obtainedSet = {};
+    var view = [];
+    var current = null;
+
+    for (var ci = 0; ci < model.courses.length; ci++) {
+      var course = model.courses[ci];
+      if (current) { view.push({ name: course.name, status: 'upcoming', rows: [] }); continue; }
+
+      var ord = orderFor(model, ci, obtainedSet);
+      var rows = [];
+      var next = null;
+      var got = gotByCourse[ci] || null;
+
+      ord.sections.forEach(function (s) {
+        var row = { section: s, status: 'untried', clashWith: null };
+        if (got && got.code === s.code) row.status = 'got';
+        else if (missed[s.code]) row.status = 'missed';
+        else {
+          var clash = null;
+          for (var k = 0; k < obtained.length; k++) if (sectionsClash(s, obtained[k])) { clash = obtained[k]; break; }
+          if (clash) { row.status = 'clash'; row.clashWith = clash; }
+          else if (!got && !skipped[ci] && !next) { row.status = 'next'; next = s; }
+        }
+        rows.push(row);
+      });
+
+      var status;
+      if (got) status = 'got';
+      else if (skipped[ci]) status = 'skipped';
+      else if (next) status = 'current';
+      else status = 'none'; // every section missed or clashing
+
+      view.push({ name: course.name, status: status, rows: rows, rule: ord.rule });
+      if (got) { obtained.push(got); obtainedSet[got.code] = true; }
+      if (status === 'current') current = { courseIndex: ci, section: next, rule: ord.rule };
+    }
+
+    return { courses: view, current: current, obtained: obtained };
+  }
+
+  var api = { parseSlot: parseSlot, sectionsClash: sectionsClash, build: build, orderFor: orderFor, compute: compute, DAYS: DAYS };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.Engine = api;
+})(this);
+
+</script>
+<script>
+// ====================================================================
+// YOUR REGISTRATION PLAN. Edit this file; the rest of the site reads it.
+// ====================================================================
+//
+// COURSES: in the order you register for them.
+//   Within each course, sections are listed best-first.
+//   times: 24-hour clock, one entry per meeting, e.g. "Mon 09:00-10:15".
+//          Days: Mon Tue Wed Thu Fri Sat Sun. Use [] for no fixed time.
+//
+// Clashes are automatic: once you get a section, later sections that overlap
+// with it in time are skipped. Back-to-back (11:00 end, 11:00 start) is allowed.
+//
+// RULES: optional "if I got X, reorder course Y" preferences.
+//   { ifGot: "A2", course: "Name", order: ["B3", "B1"] }
+//   None are needed for this plan: every preference here is a fixed ranking,
+//   and clash-skipping handles everything that depends on earlier results.
+//
+// Why this order (decided with you):
+//   - CS 429 first: top priority and most contested (4 of 6 Chatterjee sections already closed).
+//     Only open sections are included. Joshi is excluded (not in your list, all closed).
+//     52905 before 52890: 52890 (Mon-Thu 1-2) clashes with CS 103F (Tue 1-2); 52905 doesn't.
+//       (Cost, accepted: 52905 clashes with TD 301, so TD is only possible via 52890.)
+//     Fong: 52910 and 52920 each block one Ethics section and nothing else, so it's a tie,
+//       broken by your earlier-Friday preference. 52915 goes last because its Fri 1-3 blocks
+//       an Ethics section AND Global Pop Music.
+//   - UGS next: Ethics of AI sections earliest-Friday first, then Travel, then Global Pop Music.
+//     (Travel, Mon/Wed 1:30-3:00, clashes with every Chatterjee section, so it gets skipped
+//      automatically if you have Chatterjee.)
+//   - SDS 321: Hersh, Sarkar, Stipcic 10am, Stipcic 9am. Clashes with nothing in this plan.
+//   - CS 104C, CS 103F, TD 301, MUS 307, SED 303: always attempted, in that order; a section that
+//     clashes with what you have gets skipped automatically.
+
+var COURSES = [
+  {
+    name: 'CS 429 Comp Organization & Arch',
+    sections: [
+      { code: '52905', label: 'Chatterjee', times: ['Mon 14:00-15:00', 'Tue 14:00-15:00', 'Wed 14:00-15:00', 'Thu 14:00-15:00', 'Fri 15:00-17:00'] },
+      { code: '52890', label: 'Chatterjee', times: ['Mon 13:00-14:00', 'Tue 13:00-14:00', 'Wed 13:00-14:00', 'Thu 13:00-14:00', 'Fri 15:00-17:00'] },
+      { code: '52910', label: 'Fong', times: ['Tue 14:00-16:00', 'Thu 14:00-16:00', 'Fri 11:00-13:00'] },
+      { code: '52920', label: 'Fong', times: ['Tue 14:00-16:00', 'Thu 14:00-16:00', 'Fri 15:00-17:00'] },
+      { code: '52915', label: 'Fong', times: ['Tue 14:00-16:00', 'Thu 14:00-16:00', 'Fri 13:00-15:00'] },
+    ],
+  },
+  {
+    name: 'UGS signature course',
+    sections: [
+      { code: '65835', label: 'UGS 303 Ethics of AI (Fri 11)', times: ['Mon 11:00-12:00', 'Wed 11:00-12:00', 'Fri 11:00-12:00'] },
+      { code: '65850', label: 'UGS 303 Ethics of AI (Fri 2)', times: ['Mon 11:00-12:00', 'Wed 11:00-12:00', 'Fri 14:00-15:00'] },
+      { code: '65855', label: 'UGS 303 Ethics of AI (Fri 3)', times: ['Mon 11:00-12:00', 'Wed 11:00-12:00', 'Fri 15:00-16:00'] },
+      { code: '65625', label: 'UGS 302 Life Change Through Travel', times: ['Mon 13:30-15:00', 'Wed 13:30-15:00'] },
+      { code: '65925', label: 'UGS 303 Global Pop Music', times: ['Mon 11:00-12:00', 'Wed 11:00-12:00', 'Fri 14:00-15:00'] },
+    ],
+  },
+  {
+    name: 'SDS 321 Probability & Statistics',
+    sections: [
+      { code: '54550', label: 'Hersh, MWF 10-11', times: ['Mon 10:00-11:00', 'Wed 10:00-11:00', 'Fri 10:00-11:00'] },
+      { code: '54540', label: 'Sarkar, MWF 9-10', times: ['Mon 09:00-10:00', 'Wed 09:00-10:00', 'Fri 09:00-10:00'] },
+      { code: '54555', label: 'Stipcic, MWF 10-11', times: ['Mon 10:00-11:00', 'Wed 10:00-11:00', 'Fri 10:00-11:00'] },
+      { code: '54545', label: 'Stipcic, MWF 9-10', times: ['Mon 09:00-10:00', 'Wed 09:00-10:00', 'Fri 09:00-10:00'] },
+    ],
+  },
+  {
+    name: 'CS 104C Competitive Programming',
+    sections: [
+      { code: '52645', label: 'Vouga / Downing, Mon 4-5', times: ['Mon 16:00-17:00'] },
+    ],
+  },
+  {
+    name: 'CS 103F Ethical Foundations of CS',
+    sections: [
+      { code: '52640', label: 'Quimby, Tue 1-2', times: ['Tue 13:00-14:00'] },
+    ],
+  },
+  {
+    name: 'T D 301 Intro to Theatre (Internet)',
+    sections: [
+      // Listed as Internet but with scheduled times; treated as a real time commitment.
+      { code: '27425', label: 'Darlington / Beckmann, Tue/Thu 2-3:30', times: ['Tue 14:00-15:30', 'Thu 14:00-15:30'] },
+    ],
+  },
+  {
+    name: 'MUS 307 Jazz Appreciation (Internet)',
+    sections: [
+      // Listed as Internet but with scheduled times; treated as a real time commitment.
+      // Clashes with every Ethics of AI section and Global Pop Music (Mon/Wed 11-12),
+      // so it is only possible if the UGS course ends up being Travel or nothing.
+      { code: '23255', label: 'Sailors, Mon/Wed 11:30-1:00', times: ['Mon 11:30-13:00', 'Wed 11:30-13:00'] },
+    ],
+  },
+  {
+    name: 'SED 303 Autism Spectrum Disorder (Internet)',
+    sections: [
+      // No meeting times posted yet, so the tool cannot check it for clashes.
+      // If times get posted, add them here.
+      { code: '14600', label: 'Fragale, times not posted yet', times: [] },
+    ],
+  },
+];
+
+var RULES = [];
+
+if (typeof module !== 'undefined' && module.exports) module.exports = { COURSES: COURSES, RULES: RULES };
+
+</script>
+<script>
+(function () {
+  'use strict';
+  var KEY = 'registration-helper-log-v1';
+  var app = document.getElementById('app');
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // ---- Saving -------------------------------------------------------------
+  // Every click is saved twice:
+  //   1. this browser (localStorage), instantly and synchronously;
+  //   2. your Claude account (db, private per person), so it survives a cleared
+  //      browser or a different device.
+  // On load, whichever copy was saved most recently wins.
+  var savedAt = 0;
+  var localOk = false;
+  var cloud = { state: 'connecting', ref: null, ready: false, writing: false, dirty: false };
+
+  function loadLocal() {
+    try {
+      var v = JSON.parse(localStorage.getItem(KEY) || 'null');
+      localOk = true;
+      if (Array.isArray(v)) return { log: v, savedAt: 0 };                 // older format
+      if (v && Array.isArray(v.log)) return { log: v.log, savedAt: +v.savedAt || 0 };
+    } catch (e) { localOk = false; }
+    return { log: [], savedAt: 0 };
+  }
+  function saveLocal() {
+    try {
+      localStorage.setItem(KEY, JSON.stringify({ log: log, savedAt: savedAt }));
+      var check = JSON.parse(localStorage.getItem(KEY));
+      localOk = !!check && check.savedAt === savedAt;
+    } catch (e) { localOk = false; }
+  }
+  function saveLog() {
+    savedAt = Date.now();
+    saveLocal();
+    queueCloudWrite();
+  }
+
+  function queueCloudWrite() {
+    if (!cloud.ready || !cloud.ref) return;   // initial cloud read not done; it reconciles afterwards
+    if (cloud.writing) { cloud.dirty = true; return; }
+    cloud.writing = true; cloud.dirty = false; cloud.state = 'saving'; showSaveStatus();
+    cloud.ref.set({ log: log, savedAt: savedAt }).then(function () {
+      cloud.state = 'ok';
+    }, function () {
+      cloud.state = 'failed';
+    }).then(function () {
+      cloud.writing = false;
+      if (cloud.dirty) queueCloudWrite(); else showSaveStatus();
+    });
+  }
+
+  function showSaveStatus() {
+    var el = document.getElementById('save-status');
+    if (!el) return;
+    var msg, warn = false;
+    if (cloud.state === 'saving') msg = 'Saving...';
+    else if (cloud.state === 'ok') msg = localOk ? 'Saved to your Claude account and this browser.' : 'Saved to your Claude account.';
+    else if (cloud.state === 'connecting') msg = localOk ? 'Saved in this browser. Connecting to your account...' : 'Connecting to your account...';
+    else if (localOk) msg = 'Saved in this browser only. Closing the tab is fine; clearing browser data or switching devices is not.';
+    else { msg = 'Not saving right now. Keep this tab open.'; warn = true; }
+    el.textContent = msg;
+    el.className = warn ? 'save warn' : 'save';
+  }
+
+  function startCloud() {
+    var timer = setTimeout(function () {
+      if (!cloud.ready) { cloud.state = 'unavailable'; showSaveStatus(); }
+    }, 10000);
+    var api = window.claude && window.claude.use;
+    if (!api) { clearTimeout(timer); cloud.state = 'unavailable'; showSaveStatus(); return; }
+    Promise.all([window.claude.use('db'), window.claude.use('user')]).then(function (r) {
+      var db = r[0], user = r[1];
+      if (!db || !user) throw new Error('no db');
+      return user.id().then(function (uid) {
+        if (!uid) throw new Error('no id');
+        cloud.ref = db.doc('data/users/' + uid + '/progress');
+        return cloud.ref.get();
+      });
+    }).then(function (snap) {
+      clearTimeout(timer);
+      cloud.ready = true;
+      var remote = snap.exists ? snap.data() : null;
+      var remoteAt = remote && +remote.savedAt || 0;
+      if (remote && Array.isArray(remote.log) && remoteAt > savedAt) {
+        // Account copy is newer (e.g. saved on another device): use it.
+        log = remote.log.slice(); savedAt = remoteAt; saveLocal();
+        cloud.state = 'ok'; render();
+      } else if (savedAt > remoteAt) {
+        queueCloudWrite();                        // this browser is newer: push it up
+      } else {
+        cloud.state = 'ok'; showSaveStatus();     // identical, or nothing saved anywhere yet
+      }
+    }).catch(function () {
+      clearTimeout(timer);
+      cloud.state = 'unavailable'; cloud.ref = null; showSaveStatus();
+    });
+  }
+
+  var built = Engine.build(typeof COURSES !== 'undefined' ? COURSES : null, typeof RULES !== 'undefined' ? RULES : []);
+  if (built.errors) {
+    app.innerHTML = '<div class="errors"><strong>data.js has problems; fix these before registering:</strong><ul>' +
+      built.errors.map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul></div>';
+    return;
+  }
+  var model = built.model;
+  var initial = loadLocal();
+  var log = initial.log;
+  savedAt = initial.savedAt;
+
+  function act(entry) { log.push(entry); saveLog(); render(); }
+  function undo() { log.pop(); saveLog(); render(); }
+
+  // Two-click confirmation (browser confirm() dialogs are not available everywhere).
+  function armed(btn, label, onConfirm) {
+    if (btn.dataset.armed) { onConfirm(); return; }
+    var original = btn.textContent;
+    btn.dataset.armed = '1'; btn.textContent = label; btn.classList.add('arm');
+    setTimeout(function () {
+      if (!btn.isConnected) return;
+      delete btn.dataset.armed; btn.textContent = original; btn.classList.remove('arm');
+    }, 3000);
+  }
+
+  function selectCode() {
+    var el = document.querySelector('.code');
+    if (!el) return;
+    var r = document.createRange(); r.selectNodeContents(el);
+    var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }
+
+  function copy(text, btn) {
+    function done(ok, how) {
+      btn.textContent = ok ? 'Copied' : 'Selected - press Ctrl+C';
+      btn.dataset.result = ok ? 'copied-' + how : 'failed';
+      setTimeout(function () { if (btn.isConnected) btn.textContent = 'Copy code'; }, 2500);
+    }
+    // Older copy method: copies the current selection. Often still allowed inside
+    // embedded frames where the newer clipboard API is blocked.
+    function legacyCopy() {
+      selectCode();
+      try { return document.execCommand('copy'); } catch (e) { return false; }
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done(true, 'api'); },
+          function () { done(legacyCopy(), 'legacy'); });
+      } else done(legacyCopy(), 'legacy');
+    } catch (e) { done(legacyCopy(), 'legacy'); }
+  }
+
+  function statusText(row) {
+    switch (row.status) {
+      case 'got': return 'got it';
+      case 'missed': return 'missed';
+      case 'next': return 'try now';
+      case 'clash': return 'clashes';
+      default: return 'not tried';
+    }
+  }
+
+  var courseTag = { got: 'registered', skipped: 'skipped', current: 'in progress', none: 'not obtained', upcoming: 'upcoming' };
+
+  function render() {
+    var st = Engine.compute(model, log);
+    var html = '';
+    var cur = st.current;
+
+    if (cur) {
+      var s = cur.section;
+      html += '<div class="panel">' +
+        '<div class="muted">Course ' + (cur.courseIndex + 1) + ' of ' + model.courses.length + ': ' + esc(model.courses[cur.courseIndex].name) + '</div>' +
+        '<div class="code mono">' + esc(s.code) + '</div>' +
+        (s.label ? '<div>' + esc(s.label) + '</div>' : '') +
+        '<div class="muted">' + (s.times.length ? esc(s.times.join(', ')) : 'No fixed meeting time') + '</div>' +
+        '<div class="row"><button id="copy">Copy code</button></div>' +
+        '<div class="row">' +
+          '<button class="big got" id="got">I got it</button>' +
+          '<button class="big missed" id="missed">Didn\'t get it</button>' +
+        '</div>' +
+        '<div class="row">' +
+          '<button id="skip">Skip this course</button>' +
+          '<button id="undo"' + (log.length ? '' : ' disabled') + '>Undo last</button>' +
+        '</div>' +
+        (cur.rule ? '<div class="note">Order changed by rule #' + (cur.rule.index + 1) + ' (you got ' + esc(cur.rule.ifGot.join(' + ')) + ').</div>' : '') +
+        '</div>';
+    } else {
+      html += '<div class="panel"><strong>Done.</strong> ' +
+        (st.obtained.length ? 'Registered: ' + st.obtained.map(function (o) { return '<span class="mono">' + esc(o.code) + '</span> (' + esc(model.courses[o.courseIndex].name) + ')'; }).join(', ') : 'Nothing registered.') +
+        '<div class="row"><button id="undo"' + (log.length ? '' : ' disabled') + '>Undo last</button></div></div>';
+    }
+
+    html += '<h2>Progress</h2>';
+    st.courses.forEach(function (c) {
+      html += '<div class="course"><span class="name">' + esc(c.name) + '</span><span class="tag">' + courseTag[c.status] + '</span>';
+      if (c.status === 'upcoming') {
+        html += '<div class="muted">Order is worked out when you get here (depends on earlier results).</div>';
+      } else {
+        html += '<ul class="secs">' + c.rows.map(function (r) {
+          var extra = r.status === 'clash' ? ' <span class="muted">with ' + esc(r.clashWith.code) + '</span>' : '';
+          return '<li><span class="st st-' + r.status + '">' + statusText(r) + '</span>' +
+            '<span><span class="mono">' + esc(r.section.code) + '</span> ' + esc(r.section.label) + extra + '</span></li>';
+        }).join('') + '</ul>';
+      }
+      html += '</div>';
+    });
+
+    html += '<div class="row" style="margin-top:24px"><button id="reset">Start over</button></div>' +
+      '<p class="muted">Always confirm your final schedule on the registration site.</p>';
+
+    app.innerHTML = '<p id="save-status" class="save" role="status"></p>' + html;
+    showSaveStatus();
+
+    var on = function (id, fn) { var el = document.getElementById(id); if (el) el.onclick = fn; };
+    if (cur) {
+      on('copy', function () { copy(cur.section.code, this); });
+      on('got', function () { act({ code: cur.section.code, result: 'got' }); });
+      on('missed', function () { act({ code: cur.section.code, result: 'missed' }); });
+      on('skip', function () {
+        armed(this, 'Click again to skip', function () { act({ course: cur.courseIndex, result: 'skipped' }); });
+      });
+    }
+    on('undo', undo);
+    on('reset', function () {
+      armed(this, 'Click again to clear everything', function () { log = []; saveLog(); render(); });
+    });
+  }
+
+  render();
+  startCloud();
+})();
+</script>
+
+</html>
